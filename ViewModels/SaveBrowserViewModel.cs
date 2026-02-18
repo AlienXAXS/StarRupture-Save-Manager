@@ -31,7 +31,8 @@ public class SaveBrowserViewModel : ViewModelBase
         Fixers = new ObservableCollection<FixerOption>
         {
             new FixerOption("Fix Drones (Remove invalid targets)", () => new DroneFixer()),
-            new FixerOption("Remove All Drones", () => new DroneRemover())
+            new FixerOption("Remove All Drones", () => new DroneRemover()),
+            new FixerOption("Fix Junctions (3-way & 5-way multi-rail)", () => new JunctionFixer())
         };
 
         RefreshCommand = new RelayCommand(Refresh);
