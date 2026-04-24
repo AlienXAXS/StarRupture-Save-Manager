@@ -15,6 +15,9 @@ public class OrphanWindowRemover : IFixer
     private const double MaxStabilityStrength = 0.0;
     public string Name => "Orphan Window Remover";
 
+    private static readonly Regex IdPattern = new(@"\(ID=(\d+)\)", RegexOptions.Compiled);
+    private static readonly Regex StrengthPattern = new(@"Strength=([-+]?\d+(?:\.\d+)?)", RegexOptions.Compiled);
+
     private sealed record EntityInfo(long Id, string Key, JToken Entity, string ConfigPath, bool IsWindow, Vector3 Position);
 
     private sealed record WindowCandidate(
@@ -26,6 +29,73 @@ public class OrphanWindowRemover : IFixer
         double NearestDistance3D);
 
     private readonly record struct Vector3(double X, double Y, double Z);
+
+    private sealed class IdKeySet
+    {
+        private readonly HashSet<string> _exactKeys;
+        private readonly string[] _substrings;
+
+        public IdKeySet(HashSet<long> ids)
+        {
+            _exactKeys = new HashSet<string>(ids.Count * 2, StringComparer.Ordinal);
+            var substrings = new List<string>(ids.Count);
+
+            foreach (long id in ids)
+            {
+                string idKey = $"(ID={id})";
+                _exactKeys.Add(idKey);
+                _exactKeys.Add($"(UId={idKey})");
+                substrings.Add(idKey);
+            }
+
+            _substrings = substrings.ToArray();
+        }
+
+        public bool Matches(string key)
+        {
+            if (_exactKeys.Contains(key))
+            {
+                return true;
+            }
+
+            foreach (string s in _substrings)
+            {
+                if (key.Contains(s, StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    private sealed class ConnectionIndex
+    {
+        private readonly Dictionary<long, HashSet<long>> _adj = new();
+
+        public void AddEdge(long a, long b)
+        {
+            GetOrAdd(a).Add(b);
+            GetOrAdd(b).Add(a);
+        }
+
+        public IReadOnlyCollection<long> GetConnected(long id)
+        {
+            return _adj.TryGetValue(id, out HashSet<long>? set) ? set : [];
+        }
+
+        private HashSet<long> GetOrAdd(long id)
+        {
+            if (!_adj.TryGetValue(id, out HashSet<long>? set))
+            {
+                set = new HashSet<long>();
+                _adj[id] = set;
+            }
+
+            return set;
+        }
+    }
 
     public bool ApplyFix(SaveFile saveFile)
     {
@@ -56,7 +126,17 @@ public class OrphanWindowRemover : IFixer
             ConsoleLogger.Info($"Viewport/window entities: {windowIds.Count}");
             ConsoleLogger.Info($"Non-window building/support entities: {supportEntities.Count}");
 
-            List<WindowCandidate> candidates = FindCandidates(mass, entityInfos.Where(entity => entity.IsWindow), supportEntities, entitiesById, windowIds);
+            JObject? stability = mass["stabilitySubsystemState"] as JObject;
+            ConnectionIndex graphIndex = BuildGraphConnectionIndex(stability?["graphData"]?["neighbours"] as JObject);
+            ConnectionIndex customIndex = BuildCustomConnectionIndex(stability?["customConnectionData"] as JObject);
+
+            List<WindowCandidate> candidates = FindCandidates(
+                entityInfos.Where(entity => entity.IsWindow),
+                supportEntities,
+                entitiesById,
+                windowIds,
+                graphIndex,
+                customIndex);
 
             ConsoleLogger.Info($"Probable orphan window candidates: {candidates.Count}");
             foreach (WindowCandidate candidate in candidates.Take(25))
@@ -80,9 +160,12 @@ public class OrphanWindowRemover : IFixer
             }
 
             HashSet<long> idsToRemove = candidates.Select(candidate => candidate.Window.Id).ToHashSet();
-            int removedEntityCount = RemoveEntities(entities, idsToRemove);
-            int removedReferenceCount = RemoveKnownMassReferences(mass, idsToRemove);
-            int remainingReferences = CountTargetReferences(mass, idsToRemove);
+
+            IdKeySet keySet = new(idsToRemove);
+
+            int removedEntityCount = RemoveEntities(entities, keySet);
+            int removedReferenceCount = RemoveMassReferences(mass, idsToRemove, keySet);
+            int remainingReferences = CountTargetReferences(mass, keySet);
 
             ConsoleLogger.Info($"Removed window entities: {removedEntityCount}");
             ConsoleLogger.Info($"Removed Mass references: {removedReferenceCount}");
@@ -110,6 +193,68 @@ public class OrphanWindowRemover : IFixer
         }
     }
 
+    private static ConnectionIndex BuildGraphConnectionIndex(JObject? neighbours)
+    {
+        var index = new ConnectionIndex();
+        if (neighbours == null)
+        {
+            return index;
+        }
+
+        foreach (JProperty property in neighbours.Properties())
+        {
+            long? sourceId = ExtractId(property.Name);
+            if (!sourceId.HasValue)
+            {
+                continue;
+            }
+
+            if (property.Value["values"] is not JArray values)
+            {
+                continue;
+            }
+
+            foreach (JToken value in values)
+            {
+                long? targetId = ReadIdObject(value);
+                if (targetId.HasValue)
+                {
+                    index.AddEdge(sourceId.Value, targetId.Value);
+                }
+            }
+        }
+
+        return index;
+    }
+
+    private static ConnectionIndex BuildCustomConnectionIndex(JObject? customConnectionData)
+    {
+        var index = new ConnectionIndex();
+        if (customConnectionData == null)
+        {
+            return index;
+        }
+
+        foreach (JProperty property in customConnectionData.Properties())
+        {
+            long? sourceId = ExtractId(property.Name);
+            if (!sourceId.HasValue)
+            {
+                continue;
+            }
+
+            var connectedIds = new HashSet<long>();
+            AddIdsFromToken(property.Value, connectedIds);
+
+            foreach (long targetId in connectedIds)
+            {
+                index.AddEdge(sourceId.Value, targetId);
+            }
+        }
+
+        return index;
+    }
+
     private static List<EntityInfo> ReadEntityInfos(JObject entities)
     {
         var result = new List<EntityInfo>();
@@ -135,32 +280,158 @@ public class OrphanWindowRemover : IFixer
     }
 
     private static List<WindowCandidate> FindCandidates(
-        JObject mass,
         IEnumerable<EntityInfo> windows,
         IReadOnlyList<EntityInfo> nonWindows,
         IReadOnlyDictionary<long, EntityInfo> entitiesById,
-        HashSet<long> windowIds)
+        HashSet<long> windowIds,
+        ConnectionIndex graphIndex,
+        ConnectionIndex customIndex)
     {
         var candidates = new List<WindowCandidate>();
 
         foreach (EntityInfo window in windows)
         {
-            double strength = GetStabilityStrength(window.Entity);
-            int graphConnections = CountNonWindowGraphConnections(mass, window.Id, entitiesById, windowIds);
-            int customConnections = CountNonWindowCustomConnections(mass, window.Id, entitiesById, windowIds);
             EntityInfo? nearest = FindNearestNonWindow(window, nonWindows, out double nearestDistance3D);
-
-            if (nearest != null
-                && nearestDistance3D >= DistanceThreshold3D
-                && strength <= MaxStabilityStrength
-                && graphConnections == 0
-                && customConnections == 0)
+            if (nearest == null || nearestDistance3D < DistanceThreshold3D)
             {
-                candidates.Add(new WindowCandidate(window, strength, graphConnections, customConnections, nearest, nearestDistance3D));
+                continue;
             }
+
+            double strength = GetStabilityStrength(window.Entity);
+            if (strength > MaxStabilityStrength)
+            {
+                continue;
+            }
+
+            int graphConnections = CountNonWindowConnections(graphIndex, window.Id, entitiesById, windowIds);
+            if (graphConnections > 0)
+            {
+                continue;
+            }
+
+            int customConnections = CountNonWindowConnections(customIndex, window.Id, entitiesById, windowIds);
+            if (customConnections > 0)
+            {
+                continue;
+            }
+
+            candidates.Add(new WindowCandidate(window, strength, graphConnections, customConnections, nearest, nearestDistance3D));
         }
 
         return candidates;
+    }
+
+    private static int CountNonWindowConnections(
+        ConnectionIndex index,
+        long windowId,
+        IReadOnlyDictionary<long, EntityInfo> entitiesById,
+        HashSet<long> windowIds)
+    {
+        int count = 0;
+
+        foreach (long connectedId in index.GetConnected(windowId))
+        {
+            if (IsKnownNonWindow(connectedId, entitiesById, windowIds))
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    private static int RemoveEntities(JObject entities, IdKeySet keySet)
+    {
+        int removed = 0;
+
+        foreach (JProperty property in entities.Properties().ToList())
+        {
+            if (keySet.Matches(property.Name))
+            {
+                property.Remove();
+                removed++;
+            }
+        }
+
+        return removed;
+    }
+
+    private static int RemoveMassReferences(JObject mass, HashSet<long> idsToRemove, IdKeySet keySet)
+    {
+        return RemoveReferencesRecursive(mass, idsToRemove, keySet);
+    }
+
+    private static int RemoveReferencesRecursive(JToken token, HashSet<long> idsToRemove, IdKeySet keySet)
+    {
+        int removed = 0;
+
+        if (token is JObject obj)
+        {
+            foreach (JProperty property in obj.Properties().ToList())
+            {
+                if (keySet.Matches(property.Name))
+                {
+                    property.Remove();
+                    removed++;
+                }
+                else
+                {
+                    removed += RemoveReferencesRecursive(property.Value, idsToRemove, keySet);
+                }
+            }
+        }
+        else if (token is JArray array)
+        {
+            for (int i = array.Count - 1; i >= 0; i--)
+            {
+                JToken item = array[i];
+                if (TokenContainsAnyId(item, idsToRemove, keySet))
+                {
+                    item.Remove();
+                    removed++;
+                }
+                else
+                {
+                    removed += RemoveReferencesRecursive(item, idsToRemove, keySet);
+                }
+            }
+        }
+
+        return removed;
+    }
+
+    private static int CountTargetReferences(JToken token, IdKeySet keySet)
+    {
+        int count = 0;
+
+        if (token is JObject obj)
+        {
+            foreach (JProperty property in obj.Properties())
+            {
+                if (keySet.Matches(property.Name))
+                {
+                    count++;
+                }
+
+                count += CountTargetReferences(property.Value, keySet);
+            }
+        }
+        else if (token is JArray array)
+        {
+            foreach (JToken item in array)
+            {
+                count += CountTargetReferences(item, keySet);
+            }
+        }
+        else if (token is JValue value)
+        {
+            if (ValueMatchesAnyId(value, keySet))
+            {
+                count++;
+            }
+        }
+
+        return count;
     }
 
     private static bool IsWindowConfig(string configPath)
@@ -220,13 +491,22 @@ public class OrphanWindowRemover : IFixer
 
         foreach (JToken fragment in fragments)
         {
+            if (fragment is JObject fragmentObj)
+            {
+                double? direct = fragmentObj["Strength"]?.Value<double>();
+                if (direct.HasValue)
+                {
+                    return direct.Value;
+                }
+            }
+
             string fragmentText = fragment.ToString();
             if (!fragmentText.StartsWith("/Script/Chimera.CrMassBuildingStabilityData", StringComparison.Ordinal))
             {
                 continue;
             }
 
-            Match match = Regex.Match(fragmentText, @"Strength=([-+]?\d+(?:\.\d+)?)");
+            Match match = StrengthPattern.Match(fragmentText);
             if (match.Success && double.TryParse(match.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out double strength))
             {
                 return strength;
@@ -244,6 +524,13 @@ public class OrphanWindowRemover : IFixer
         foreach (EntityInfo other in nonWindows)
         {
             double distance = Distance3D(window.Position, other.Position);
+
+            if (distance < DistanceThreshold3D)
+            {
+                nearestDistance3D = distance;
+                return other;
+            }
+
             if (distance < nearestDistance3D)
             {
                 nearestDistance3D = distance;
@@ -262,253 +549,38 @@ public class OrphanWindowRemover : IFixer
         return Math.Sqrt(dx * dx + dy * dy + dz * dz);
     }
 
-    private static int CountNonWindowGraphConnections(
-        JObject mass,
-        long windowId,
-        IReadOnlyDictionary<long, EntityInfo> entitiesById,
-        HashSet<long> windowIds)
-    {
-        if (mass["stabilitySubsystemState"]?["graphData"]?["neighbours"] is not JObject neighbours)
-        {
-            return 0;
-        }
-
-        var connectedIds = new HashSet<long>();
-        AddIdsFromValues(neighbours[FormatIdKey(windowId)]?["values"], connectedIds);
-
-        foreach (JProperty property in neighbours.Properties())
-        {
-            long? sourceId = ExtractId(property.Name);
-            if (!sourceId.HasValue || sourceId.Value == windowId)
-            {
-                continue;
-            }
-
-            if (TokenContainsId(property.Value, windowId))
-            {
-                connectedIds.Add(sourceId.Value);
-            }
-        }
-
-        return connectedIds.Count(id => IsKnownNonWindow(id, entitiesById, windowIds));
-    }
-
-    private static int CountNonWindowCustomConnections(
-        JObject mass,
-        long windowId,
-        IReadOnlyDictionary<long, EntityInfo> entitiesById,
-        HashSet<long> windowIds)
-    {
-        if (mass["stabilitySubsystemState"]?["customConnectionData"] is not JObject customConnectionData)
-        {
-            return 0;
-        }
-
-        var connectedIds = new HashSet<long>();
-        AddIdsFromToken(customConnectionData[FormatIdKey(windowId)], connectedIds);
-
-        foreach (JProperty property in customConnectionData.Properties())
-        {
-            long? sourceId = ExtractId(property.Name);
-            if (!sourceId.HasValue || sourceId.Value == windowId)
-            {
-                continue;
-            }
-
-            if (TokenContainsId(property.Value, windowId))
-            {
-                connectedIds.Add(sourceId.Value);
-            }
-        }
-
-        return connectedIds.Count(id => IsKnownNonWindow(id, entitiesById, windowIds));
-    }
-
     private static bool IsKnownNonWindow(long id, IReadOnlyDictionary<long, EntityInfo> entitiesById, HashSet<long> windowIds)
     {
         return entitiesById.ContainsKey(id) && !windowIds.Contains(id);
     }
 
-    private static int RemoveEntities(JObject entities, HashSet<long> idsToRemove)
+    private static bool TokenContainsAnyId(JToken token, HashSet<long> idsToRemove, IdKeySet keySet)
     {
-        int removed = 0;
-
-        foreach (long id in idsToRemove)
+        if (token is JObject obj)
         {
-            if (entities.Remove(FormatIdKey(id)))
+            long? objectId = ReadIdObject(obj);
+            if (objectId.HasValue && idsToRemove.Contains(objectId.Value))
             {
-                removed++;
+                return true;
             }
-        }
 
-        return removed;
-    }
-
-    private static int RemoveKnownMassReferences(JObject mass, HashSet<long> idsToRemove)
-    {
-        int removed = 0;
-
-        if (mass["stabilitySubsystemState"] is JObject stability)
-        {
-            removed += RemoveTargetKeyedProperties(stability["graphData"]?["neighbours"] as JObject, idsToRemove);
-            removed += RemoveTargetKeyedProperties(stability["graphData"]?["nodeDatas"] as JObject, idsToRemove);
-            removed += RemoveTargetKeyedProperties(stability["customConnectionData"] as JObject, idsToRemove);
-            removed += RemoveTargetKeyedProperties(stability["rampConnectionData"] as JObject, idsToRemove);
-            removed += RemoveTargetKeyedProperties(stability["buildingFoundationData"] as JObject, idsToRemove);
-            removed += RemoveTargetKeyedProperties(stability["buildingDefaultFoundationData"] as JObject, idsToRemove);
-            removed += RemoveArrayItemsReferencingIds(stability, idsToRemove);
-        }
-
-        if (mass["electricitySubsystemState"] is JObject electricity)
-        {
-            removed += RemoveTargetKeyedProperties(electricity["nodeData"] as JObject, idsToRemove);
-            removed += RemoveEntriesContainingIds(electricity["connectorData"] as JObject, idsToRemove);
-            removed += RemoveArrayItemsReferencingIds(electricity, idsToRemove);
-        }
-
-        removed += RemoveEntriesContainingIds(mass["foundableEntitiesSpawnData"] as JObject, idsToRemove);
-        removed += RemoveEntriesContainingIds(mass["foundableEntityToPersistentIdMap"] as JObject, idsToRemove);
-        removed += RemoveEntriesContainingIds(mass["buildingSpawnPointsSaveData"]?["spawnPointOwnerships"] as JObject, idsToRemove);
-        removed += RemoveEntriesContainingIds(mass["logisticsRequestSubsystemState"]?["requestData"] as JObject, idsToRemove);
-        removed += RemoveEntriesContainingIds(mass["logisticsRequestSubsystemState"]?["storageToItemsInTransfer"] as JObject, idsToRemove);
-        removed += RemoveArrayItemsReferencingIds(mass, idsToRemove);
-        removed += RemoveTargetKeyedProperties(mass, idsToRemove);
-
-        return removed;
-    }
-
-    private static int RemoveTargetKeyedProperties(JObject? obj, HashSet<long> idsToRemove)
-    {
-        if (obj == null)
-        {
-            return 0;
-        }
-
-        int removed = 0;
-        foreach (JProperty property in obj.Properties().ToList())
-        {
-            if (IsTargetKey(property.Name, idsToRemove))
+            foreach (JProperty property in obj.Properties())
             {
-                property.Remove();
-                removed++;
+                if (keySet.Matches(property.Name) || TokenContainsAnyId(property.Value, idsToRemove, keySet))
+                {
+                    return true;
+                }
             }
+
+            return false;
         }
-
-        return removed;
-    }
-
-    private static int RemoveEntriesContainingIds(JObject? obj, HashSet<long> idsToRemove)
-    {
-        if (obj == null)
-        {
-            return 0;
-        }
-
-        int removed = 0;
-        foreach (JProperty property in obj.Properties().ToList())
-        {
-            if (IsTargetKey(property.Name, idsToRemove) || TokenContainsAnyId(property.Value, idsToRemove))
-            {
-                property.Remove();
-                removed++;
-            }
-        }
-
-        return removed;
-    }
-
-    private static int RemoveArrayItemsReferencingIds(JToken token, HashSet<long> idsToRemove)
-    {
-        int removed = 0;
 
         if (token is JArray array)
         {
-            for (int index = array.Count - 1; index >= 0; index--)
-            {
-                JToken item = array[index];
-                if (TokenContainsAnyId(item, idsToRemove))
-                {
-                    item.Remove();
-                    removed++;
-                }
-                else
-                {
-                    removed += RemoveArrayItemsReferencingIds(item, idsToRemove);
-                }
-            }
-        }
-        else if (token is JObject obj)
-        {
-            foreach (JProperty property in obj.Properties().ToList())
-            {
-                if (IsTargetKey(property.Name, idsToRemove))
-                {
-                    property.Remove();
-                    removed++;
-                }
-                else
-                {
-                    removed += RemoveArrayItemsReferencingIds(property.Value, idsToRemove);
-                }
-            }
+            return array.Any(item => TokenContainsAnyId(item, idsToRemove, keySet));
         }
 
-        return removed;
-    }
-
-    private static int CountTargetReferences(JToken token, HashSet<long> idsToRemove)
-    {
-        int count = 0;
-
-        if (token is JObject obj)
-        {
-            foreach (JProperty property in obj.Properties())
-            {
-                if (IsTargetKey(property.Name, idsToRemove))
-                {
-                    count++;
-                }
-
-                count += CountTargetReferences(property.Value, idsToRemove);
-            }
-        }
-        else if (token is JArray array)
-        {
-            foreach (JToken item in array)
-            {
-                count += CountTargetReferences(item, idsToRemove);
-            }
-        }
-        else if (token is JValue value)
-        {
-            foreach (long id in idsToRemove)
-            {
-                if (ValueMatchesId(value, id))
-                {
-                    count++;
-                    break;
-                }
-            }
-        }
-
-        return count;
-    }
-
-    private static void AddIdsFromValues(JToken? valuesToken, HashSet<long> ids)
-    {
-        if (valuesToken is not JArray values)
-        {
-            return;
-        }
-
-        foreach (JToken value in values)
-        {
-            long? id = ReadIdObject(value);
-            if (id.HasValue)
-            {
-                ids.Add(id.Value);
-            }
-        }
+        return token is JValue value && ValueMatchesAnyId(value, keySet);
     }
 
     private static void AddIdsFromToken(JToken? token, HashSet<long> ids)
@@ -530,35 +602,11 @@ public class OrphanWindowRemover : IFixer
         }
     }
 
-    private static bool TokenContainsAnyId(JToken token, HashSet<long> idsToRemove)
-    {
-        return idsToRemove.Any(id => TokenContainsId(token, id));
-    }
-
-    private static bool TokenContainsId(JToken token, long id)
-    {
-        if (token is JObject obj)
-        {
-            long? objectId = ReadIdObject(obj);
-            if (objectId == id)
-            {
-                return true;
-            }
-
-            return obj.Properties().Any(property => IsTargetKey(property.Name, id) || TokenContainsId(property.Value, id));
-        }
-
-        if (token is JArray array)
-        {
-            return array.Any(item => TokenContainsId(item, id));
-        }
-
-        return token is JValue value && ValueMatchesId(value, id);
-    }
-
     private static long? ReadIdObject(JToken token)
     {
-        if (token is JObject obj && obj["iD"] != null && long.TryParse(obj["iD"]!.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out long id))
+        if (token is JObject obj
+            && obj["iD"] != null
+            && long.TryParse(obj["iD"]!.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out long id))
         {
             return id;
         }
@@ -566,25 +614,15 @@ public class OrphanWindowRemover : IFixer
         return null;
     }
 
-    private static bool ValueMatchesId(JValue value, long id)
+    private static bool ValueMatchesAnyId(JValue value, IdKeySet keySet)
     {
-        if (value.Type == JTokenType.Integer && Convert.ToInt64(value.Value, CultureInfo.InvariantCulture) == id)
+        if (value.Type == JTokenType.String)
         {
-            return true;
+            string? str = Convert.ToString(value.Value, CultureInfo.InvariantCulture);
+            return str != null && keySet.Matches(str);
         }
 
-        return value.Type == JTokenType.String && Convert.ToString(value.Value, CultureInfo.InvariantCulture)?.Contains(FormatIdKey(id), StringComparison.Ordinal) == true;
-    }
-
-    private static bool IsTargetKey(string key, HashSet<long> idsToRemove)
-    {
-        return idsToRemove.Any(id => IsTargetKey(key, id));
-    }
-
-    private static bool IsTargetKey(string key, long id)
-    {
-        string idKey = FormatIdKey(id);
-        return key == idKey || key == $"(UId={idKey})" || key.Contains(idKey, StringComparison.Ordinal);
+        return false;
     }
 
     private static string FormatIdKey(long id)
@@ -594,7 +632,7 @@ public class OrphanWindowRemover : IFixer
 
     private static long? ExtractId(string key)
     {
-        Match match = Regex.Match(key, @"\(ID=(\d+)\)");
+        Match match = IdPattern.Match(key);
         return match.Success ? long.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture) : null;
     }
 }
