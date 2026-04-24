@@ -32,7 +32,8 @@ public class SaveBrowserViewModel : ViewModelBase
         {
             new FixerOption("Fix Drones (Remove invalid targets)", () => new DroneFixer()),
             new FixerOption("Remove All Drones", () => new DroneRemover()),
-            new FixerOption("Fix Junctions (3-way & 5-way multi-rail)", () => new JunctionFixer())
+            new FixerOption("Fix Junctions (3-way & 5-way multi-rail)", () => new JunctionFixer()),
+            new FixerOption("Remove Orphan Windows", () => new OrphanWindowRemover())
         };
 
         RefreshCommand = new RelayCommand(Refresh);

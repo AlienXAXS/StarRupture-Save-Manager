@@ -19,6 +19,7 @@ A Windows desktop application for managing and repairing save files for the game
 ### Save File Repair
 - **Fix Drones** – Automatically detects and removes drones with invalid movement targets that cause save corruption
 - **Remove All Drones** – Completely removes all drone entities from your save file
+- **Remove Orphan Windows** – Removes unsupported orphan viewport/window entities
 - **Non-destructive** – Original save files are backed up with `_original.sav` suffix before modifications
 
 ### Session Management
@@ -76,7 +77,7 @@ dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=
 1. **Launch the application** – Run `StarRuptureSaveFixer.exe`
 2. **Select a session** – Your save sessions are automatically detected and listed
 3. **Choose a save file** – Select the save you want to fix or manage
-4. **Apply fixes** – Click "Fix Drones" or "Remove All Drones" as needed
+4. **Apply fixes** – Choose a fixer such as "Fix Drones", "Remove All Drones", or "Remove Orphan Windows"
 
 The application automatically backs up your original save before making any changes.
 
@@ -103,6 +104,18 @@ The tool:
 3. Identifies problematic entities (drones with invalid movement targets)
 4. Removes or repairs the identified issues
 5. Recompresses with proper zlib format and saves the fixed file
+
+### Orphan Window Removal
+
+The orphan window fixer removes probable orphan viewport entities only when all strict conditions are true:
+
+- type is `ViewportLeft`, `ViewportMiddle`, `ViewportRight`, or `ViewportSingle`
+- nearest non-window building/support entity is at least `300` units away in 3D
+- stability strength is `0` or lower
+- no stability graph connection points to a non-window entity
+- no custom/support connection points to a non-window entity
+
+It then removes the window ID from Mass entities, stability graph data, custom connection data, electricity graph data, and other known Mass save maps. This avoids the incomplete deletion issue caused by removing only `itemData.Mass.entities`.
 
 ## Project Structure
 
