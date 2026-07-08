@@ -1,6 +1,7 @@
 using System.Net.Http;
 using System.Text.Json;
 using System.Reflection;
+using StarRuptureSaveFixer.Utils;
 
 namespace StarRuptureSaveFixer.Services;
 
@@ -16,14 +17,27 @@ public class UpdateChecker
     {
         try
         {
+            string currentVersion = GetCurrentVersion();
+            ConsoleLogger.Info($"Checking for updates (current version: v{currentVersion})...");
+            ConsoleLogger.Info($"Querying repository: {GITHUB_API_URL}");
+
             var response = await _httpClient.GetStringAsync(GITHUB_API_URL);
             var release = JsonDocument.Parse(response);
             var root = release.RootElement;
 
             string latestVersion = root.GetProperty("tag_name").GetString()?.TrimStart('v') ?? "";
-            string currentVersion = GetCurrentVersion();
+            ConsoleLogger.Info($"Latest version on repository: v{latestVersion}");
 
             bool updateAvailable = IsNewerVersion(latestVersion, currentVersion);
+
+            if (updateAvailable)
+            {
+                ConsoleLogger.Success($"Update available: v{currentVersion} -> v{latestVersion}");
+            }
+            else
+            {
+                ConsoleLogger.Info($"You are running the latest version (v{currentVersion}).");
+            }
 
             return new UpdateInfo
             {
@@ -34,9 +48,10 @@ public class UpdateChecker
                 ReleaseNotes = root.GetProperty("body").GetString() ?? ""
             };
         }
-        catch
+        catch (Exception ex)
         {
-            return null; // Silently fail if update check fails
+            ConsoleLogger.Warning($"Update check failed: {ex.Message}");
+            return null; // Fail quietly for the caller, but the failure is now logged
         }
     }
 

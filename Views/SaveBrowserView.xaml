@@ -96,23 +96,39 @@
         <!-- Fix Options -->
         <GroupBox Grid.Row="2" Header="Fix Options" Padding="10" Margin="0,10,0,0">
             <Grid>
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
 
-                <StackPanel Grid.Column="0">
-                    <ComboBox ItemsSource="{Binding Fixers}"
-                              SelectedIndex="{Binding SelectedFixerIndex}"
-                              MinWidth="300" Margin="0,0,10,0"/>
-                </StackPanel>
+                <Grid Grid.Row="0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
 
-                <Button Grid.Column="1"
-                        Content="Fix Selected Save"
-                        Command="{Binding FixSelectedCommand}"
-                        Style="{StaticResource FixButton}"
-                        MinWidth="150"
-                        IsEnabled="{Binding CanFixSelected}"/>
+                    <StackPanel Grid.Column="0">
+                        <ComboBox ItemsSource="{Binding Fixers}"
+                                  SelectedIndex="{Binding SelectedFixerIndex}"
+                                  MinWidth="300" Margin="0,0,10,0"/>
+                    </StackPanel>
+
+                    <Button Grid.Column="1"
+                            Content="Fix Selected Save"
+                            Command="{Binding FixSelectedCommand}"
+                            Style="{StaticResource FixButton}"
+                            MinWidth="150"
+                            IsEnabled="{Binding CanFixSelected}"/>
+                </Grid>
+
+                <ProgressBar Grid.Row="1"
+                             Height="8"
+                             Margin="0,10,0,0"
+                             Minimum="0"
+                             Maximum="{Binding ProgressMaximum}"
+                             Value="{Binding ProgressValue, Mode=OneWay}"
+                             IsIndeterminate="{Binding IsProgressIndeterminate}"
+                             Visibility="{Binding IsProcessing, Converter={StaticResource BoolToVisibilityConverter}}"/>
             </Grid>
         </GroupBox>
 

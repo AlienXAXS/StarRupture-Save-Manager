@@ -20,6 +20,8 @@ public class SaveBrowserViewModel : ViewModelBase
     private string _logOutput = "";
     private bool _isProcessing;
     private int _selectedFixerIndex;
+    private int _progressValue;
+    private int _progressMaximum;
 
     public SaveBrowserViewModel(string? customPath = null)
     {
@@ -32,8 +34,8 @@ public class SaveBrowserViewModel : ViewModelBase
         {
             new FixerOption("Fix Drones (Remove invalid targets)", () => new DroneFixer()),
             new FixerOption("Remove All Drones", () => new DroneRemover()),
-            new FixerOption("Fix Junctions (3-way & 5-way multi-rail)", () => new JunctionFixer()),
-            new FixerOption("Remove Orphan Windows", () => new OrphanWindowRemover())
+            new FixerOption("Remove Orphan Windows", () => new OrphanWindowRemover()),
+            new FixerOption("Remove Invalid Invisible Drone Poles", () => new InvalidInvisibleDronePoleRemover())
         };
 
         RefreshCommand = new RelayCommand(Refresh);
@@ -43,6 +45,7 @@ public class SaveBrowserViewModel : ViewModelBase
         // Subscribe to logger
         ConsoleLogger.ProgressLogged += OnProgressLogged;
         ConsoleLogger.MessageLogged += OnMessageLogged;
+        ConsoleLogger.ProgressReported += OnProgressReported;
 
         // Load sessions on initialization
         Refresh();
@@ -60,6 +63,12 @@ public class SaveBrowserViewModel : ViewModelBase
     {
         // Surface messages in the log
         LogMessage(message, level == "PROGRESS" ? "Info" : level);
+    }
+
+    private void OnProgressReported(int current, int total)
+    {
+        ProgressMaximum = total;
+        ProgressValue = current;
     }
 
     public void UpdateCustomPath(string? customPath)
@@ -118,9 +127,39 @@ public class SaveBrowserViewModel : ViewModelBase
             if (SetProperty(ref _isProcessing, value))
             {
                 OnPropertyChanged(nameof(CanFixSelected));
+                OnPropertyChanged(nameof(IsProgressIndeterminate));
             }
         }
     }
+
+    public int ProgressValue
+    {
+        get => _progressValue;
+        set
+        {
+            if (SetProperty(ref _progressValue, value))
+            {
+                OnPropertyChanged(nameof(IsProgressIndeterminate));
+            }
+        }
+    }
+
+    public int ProgressMaximum
+    {
+        get => _progressMaximum;
+        set
+        {
+            if (SetProperty(ref _progressMaximum, value))
+            {
+                OnPropertyChanged(nameof(IsProgressIndeterminate));
+            }
+        }
+    }
+
+    /// <summary>
+    /// True while processing but no measurable total has been reported yet (e.g. still counting).
+    /// </summary>
+    public bool IsProgressIndeterminate => IsProcessing && ProgressMaximum <= 0;
 
     public bool CanFixSelected => !IsProcessing && SelectedSaveFile != null && !SelectedSaveFile.IsBackup;
 
@@ -167,6 +206,8 @@ public class SaveBrowserViewModel : ViewModelBase
 
         IsProcessing = true;
         LogOutput = ""; // Clear log
+        ProgressValue = 0;
+        ProgressMaximum = 0; // Unknown total yet -> indeterminate
 
         try
         {
@@ -247,6 +288,8 @@ public class SaveBrowserViewModel : ViewModelBase
         finally
         {
             IsProcessing = false;
+            ProgressValue = 0;
+            ProgressMaximum = 0;
         }
     }
 

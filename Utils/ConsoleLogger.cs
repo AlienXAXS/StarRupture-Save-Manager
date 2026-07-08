@@ -18,6 +18,11 @@ public static class ConsoleLogger
     /// </summary>
     public static event Action<string>? ProgressLogged;
 
+    /// <summary>
+    /// Raised for measurable progress (current/total), intended to drive a determinate progress bar.
+    /// </summary>
+    public static event Action<int, int>? ProgressReported;
+
     public static void Info(string message)
     {
         MessageLogged?.Invoke("INFO", message);
@@ -43,6 +48,14 @@ public static class ConsoleLogger
         // Progress messages also surface as general log messages with level "PROGRESS"
         //MessageLogged?.Invoke("PROGRESS", message);
         ProgressLogged?.Invoke(message);
+    }
+
+    /// <summary>
+    /// Reports measurable progress (e.g. items fixed so far out of a known total).
+    /// </summary>
+    public static void ReportProgress(int current, int total)
+    {
+        ProgressReported?.Invoke(current, total);
     }
 
     /// <summary>
